@@ -1,0 +1,553 @@
+import requests
+import json
+import time
+import openpyxl
+from datetime import datetime
+from openpyxl.styles import PatternFill, Font, Alignment
+from openpyxl.utils import get_column_letter
+
+# Base URL for the Wallex API
+base_url = "https://api.wallex.ir/v1/"
+
+# --- Configuration for identifying best arbitrage opportunities ---
+# These values are examples and should be adjusted based on real market conditions and your risk tolerance.
+# A positive difference means calculated price (USDT*TMN) > direct TMN price.
+# This implies buying in TMN and selling in USDT (after converting USDT to TMN).
+MIN_PERCENT_DIFFERENCE_FOR_OPPORTUNITY = 0.1 # 0.1% minimum positive difference to be considered for console print
+MIN_QUOTE_VOLUME_USDT_FOR_LIQUIDITY = 1000  # Minimum 24h quote volume in USDT (e.g., 1000 USDT)
+MIN_QUOTE_VOLUME_TMN_FOR_LIQUIDITY = 50000000 # Minimum 24h quote volume in TMN (e.g., 50 million Toman)
+
+# --- Excel Formatting Thresholds (for highlighting) ---
+HIGHLIGHT_POSITIVE_ARB_THRESHOLD = 0.5 # Highlight green if percentage_difference >= 0.5%
+HIGHLIGHT_NEGATIVE_ARB_THRESHOLD = -0.5 # Highlight red if percentage_difference <= -0.5%
+# --- End Configuration ---
+
+
+def get_wallex_markets():
+    """Retrieves the list of markets from Wallex."""
+    try:
+        response = requests.get(base_url + "markets")
+        response.raise_for_status() # Raises an HTTPError for bad responses (4xx or 5xx)
+        data = response.json().get("result", {}).get("symbols", {})
+        return data
+    except requests.exceptions.RequestException as e:
+        print(f"Error fetching market list from Wallex API: {e}")
+        return {}
+
+def get_global_currency_stats():
+    """Retrieves global cryptocurrency statistics."""
+    try:
+        response = requests.get(base_url + "currencies/stats")
+        response.raise_for_status() # Raises an HTTPError for bad responses (4xx or 5xx)
+        data = response.json().get("result", [])
+        # Convert list of dicts to a dict keyed by 'key' (symbol like BTC, ETH) for easier lookup
+        return {item['key']: item for item in data}
+    except requests.exceptions.RequestException as e:
+        print(f"Error fetching global currency stats from Wallex API: {e}")
+        return {}
+
+def safe_float_conversion(value):
+    """Safely converts a string to float, handling None, empty string, and '-'."""
+    if value is None or value == '' or value == '-':
+        return None
+    try:
+        return float(value)
+    except ValueError:
+        return None
+
+def analyze_arbitrage_prices():
+    """Analyzes arbitrage opportunities based on price and returns the data."""
+    wallex_markets = get_wallex_markets()
+    global_stats = get_global_currency_stats() # Fetch global stats once
+    
+    # Get USDT/TMN price directly from markets endpoint
+    tether_price_tmn = None
+    if "USDTTMN" in wallex_markets and wallex_markets["USDTTMN"].get('stats'):
+        tether_price_tmn_str = wallex_markets["USDTTMN"]["stats"].get('lastPrice')
+        tether_price_tmn = safe_float_conversion(tether_price_tmn_str)
+
+    arbitrage_data = [] # Data for Excel output (all calculated data)
+    potential_opportunities = [] # Opportunities meeting basic criteria (positive diff, has volume)
+
+    if tether_price_tmn is not None and wallex_markets: # Ensure we have tether price and markets data
+        print(f"Tether price in Toman market: {tether_price_tmn:.2f}")
+        print("-------------------- Arbitrage Analysis Based on Price --------------------")
+        for symbol, details in wallex_markets.items():
+            # Only consider base assets that have a USDT pair (and are not USDTTMN itself)
+            if symbol.endswith("USDT") and symbol != "USDTTMN": 
+                base_asset = symbol[:-4]
+                
+                # Get market-specific stats for USDT pair
+                usdt_stats = details.get('stats', {})
+                usdt_last_price = safe_float_conversion(usdt_stats.get('lastPrice'))
+                usdt_bid_price = safe_float_conversion(usdt_stats.get('bidPrice'))
+                usdt_ask_price = safe_float_conversion(usdt_stats.get('askPrice'))
+                usdt_volume_24h = safe_float_conversion(usdt_stats.get('24h_volume'))
+                usdt_quote_volume_24h = safe_float_conversion(usdt_stats.get('24h_quoteVolume'))
+                
+                tmn_symbol = f"{base_asset}TMN"
+
+                # Check if the corresponding TMN pair exists and has stats
+                if usdt_last_price is not None and tmn_symbol in wallex_markets and wallex_markets[tmn_symbol].get('stats'):
+                    tmn_stats = wallex_markets[tmn_symbol].get('stats', {})
+                    tmn_last_price_direct = safe_float_conversion(tmn_stats.get('lastPrice'))
+                    tmn_bid_price = safe_float_conversion(tmn_stats.get('bidPrice'))
+                    tmn_ask_price = safe_float_conversion(tmn_stats.get('askPrice'))
+                    tmn_volume_24h = safe_float_conversion(tmn_stats.get('24h_volume'))
+                    tmn_quote_volume_24h = safe_float_conversion(tmn_stats.get('24h_quoteVolume'))
+                    
+                    if tmn_last_price_direct is not None:
+                        calculated_price_tmn_from_usdt = usdt_last_price * tether_price_tmn
+                        price_difference = calculated_price_tmn_from_usdt - tmn_last_price_direct
+                        
+                        # Avoid division by zero for percentage_difference
+                        percentage_difference = (price_difference / tmn_last_price_direct) * 100 if tmn_last_price_direct != 0 else 0 
+
+                        # Get global stats for the base asset if available
+                        global_asset_stats = global_stats.get(base_asset, {})
+                        global_price = safe_float_conversion(global_asset_stats.get('price'))
+                        global_volume_24h = safe_float_conversion(global_asset_stats.get('volume_24h'))
+                        global_market_cap = safe_float_conversion(global_asset_stats.get('market_cap'))
+                        global_percent_change_24h = safe_float_conversion(global_asset_stats.get('percent_change_24h'))
+
+                        # Store all data for Excel output (original numerical values for proper Excel formatting)
+                        current_analysis = {
+                            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                            "symbol": base_asset,
+                            "price_usdt_last": usdt_last_price,
+                            "price_usdt_bid": usdt_bid_price,
+                            "price_usdt_ask": usdt_ask_price,
+                            "volume_usdt_24h": usdt_volume_24h,
+                            "quote_volume_usdt_24h": usdt_quote_volume_24h,
+                            "price_tmn_calculated": calculated_price_tmn_from_usdt,
+                            "price_tmn_direct": tmn_last_price_direct,
+                            "price_tmn_bid": tmn_bid_price,
+                            "price_tmn_ask": tmn_ask_price,
+                            "volume_tmn_24h": tmn_volume_24h,
+                            "quote_volume_tmn_24h": tmn_quote_volume_24h,
+                            "price_difference": price_difference,
+                            "percentage_difference": percentage_difference,
+                            "global_price": global_price,
+                            "global_volume_24h": global_volume_24h,
+                            "global_market_cap": global_market_cap,
+                            "global_percent_change_24h": global_percent_change_24h,
+                        }
+                        arbitrage_data.append(current_analysis)
+                        
+                        # Store potential opportunities (for console print)
+                        # Filter for positive arbitrage opportunity
+                        if percentage_difference > MIN_PERCENT_DIFFERENCE_FOR_OPPORTUNITY and \
+                           usdt_quote_volume_24h is not None and usdt_quote_volume_24h >= MIN_QUOTE_VOLUME_USDT_FOR_LIQUIDITY and \
+                           tmn_quote_volume_24h is not None and tmn_quote_volume_24h >= MIN_QUOTE_VOLUME_TMN_FOR_LIQUIDITY:
+                            potential_opportunities.append({
+                                "symbol": base_asset,
+                                "percentage_difference": percentage_difference,
+                                "usdt_quote_volume_24h": usdt_quote_volume_24h,
+                                "tmn_quote_volume_24h": tmn_quote_volume_24h,
+                                "price_usdt_last": usdt_last_price,
+                                "price_tmn_calculated": calculated_price_tmn_from_usdt,
+                                "price_tmn_direct": tmn_last_price_direct,
+                                "price_difference": price_difference
+                            })
+                        
+                        # Print to console (formatted strings)
+                        print(f"Asset: {base_asset}")
+                        print(f"  USDT (Last/Bid/Ask): {current_analysis['price_usdt_last']}/{current_analysis['price_usdt_bid']}/{current_analysis['price_usdt_ask']} (Vol: {current_analysis['volume_usdt_24h']} {base_asset})")
+                        print(f"  TMN Calc: {current_analysis['price_tmn_calculated']}, TMN Direct (Last/Bid/Ask): {current_analysis['price_tmn_direct']}/{current_analysis['price_tmn_bid']}/{current_analysis['price_tmn_ask']} (Vol: {current_analysis['volume_tmn_24h']} {base_asset})")
+                        print(f"  Price Diff: {current_analysis['price_difference']}, Percentage Diff: {current_analysis['percentage_difference']}%")
+                        print(f"  Global Price: {current_analysis['global_price']}, Global 24h Vol: {current_analysis['global_volume_24h']}, Global Market Cap: {current_analysis['global_market_cap']}, Global 24h Chg: {current_analysis['global_percent_change_24h']}%")
+                        print("-------------------------------------------------------")
+    else:
+        print("Error fetching Tether price in Toman market. Cannot perform arbitrage analysis.")
+        return [] # Return empty list if critical data is missing
+
+    # --- Identify and print best opportunities ---
+    print("\n======== Best Arbitrage Opportunities (Based on Filters) ========")
+    # Opportunities are already filtered for MIN_PERCENT_DIFFERENCE_FOR_OPPORTUNITY and liquidity earlier
+    # So we just need to sort them now.
+    filtered_opportunities = potential_opportunities # Use the already filtered list
+
+    # Sort by percentage difference in descending order
+    filtered_opportunities.sort(key=lambda x: x['percentage_difference'], reverse=True)
+
+    if filtered_opportunities:
+        print(f"Found {len(filtered_opportunities)} potential opportunities meeting minimum criteria:")
+        for i, op in enumerate(filtered_opportunities[:5]): # Print top 5 opportunities
+            print(f"  {i+1}. Symbol: {op['symbol']}")
+            print(f"     Percentage Diff: {op['percentage_difference']:.4f}%")
+            print(f"     USDT Quote Volume (24h): {op['usdt_quote_volume_24h']:.2f}")
+            print(f"     TMN Quote Volume (24h): {op['tmn_quote_volume_24h']:.2f}")
+            print(f"     Calc TMN Price: {op['price_tmn_calculated']:.2f}, Direct TMN Price: {op['price_tmn_direct']:.2f}")
+            print("     --------------------")
+    else:
+        print("No arbitrage opportunities found meeting the specified criteria (%.4f%% diff and liquidity)." % MIN_PERCENT_DIFFERENCE_FOR_OPPORTUNITY)
+    print("================================================================")
+
+    return arbitrage_data # This list goes to Excel
+
+def save_arbitrage_data_to_excel(arbitrage_data, filename="arbitrage_analysis_full_data.xlsx"):
+    """Saves the arbitrage data with full market and global stats to an Excel file with clean formatting."""
+    try:
+        workbook = openpyxl.Workbook()
+        sheet = workbook.active
+
+        # Define headers
+        header = [
+            "Timestamp", "Symbol", 
+            "Price (USDT) Last", "Price (USDT) Bid", "Price (USDT) Ask", "Volume (USDT) 24h", "Quote Volume (USDT) 24h",
+            "Calculated Price (TMN)", "Direct Price (TMN) Last", "Price (TMN) Bid", "Price (TMN) Ask", 
+            "Volume (TMN) 24h", "Quote Volume (TMN) 24h",
+            "Price Difference", "Percentage Difference (%)",
+            "Global Price", "Global Volume 24h", "Global Market Cap", "Global % Change 24h"
+        ]
+        sheet.append(header)
+
+        # Define colors for highlighting
+        green_fill = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid") # Light Green
+        red_fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")     # Light Red
+        yellow_fill = PatternFill(start_color="FFEB9C", end_color="FFEB9C", fill_type="solid")   # Light Yellow
+
+        # Apply data and formatting
+        for row_idx, data_row in enumerate(arbitrage_data, start=2): # Start from row 2 as row 1 is header
+            # Append data, ensuring conversion to actual numbers where possible
+            row_values = [
+                data_row.get("timestamp", "N/A"),
+                data_row.get("symbol", "N/A"),
+                data_row.get("price_usdt_last", "N/A"),
+                data_row.get("price_usdt_bid", "N/A"),
+                data_row.get("price_usdt_ask", "N/A"),
+                data_row.get("volume_usdt_24h", "N/A"),
+                data_row.get("quote_volume_usdt_24h", "N/A"),
+                data_row.get("price_tmn_calculated", "N/A"), # Keep as string for now if formatted
+                data_row.get("price_tmn_direct", "N/A"),     # Keep as string for now if formatted
+                data_row.get("price_tmn_bid", "N/A"),
+                data_row.get("price_tmn_ask", "N/A"),
+                data_row.get("volume_tmn_24h", "N/A"),
+                data_row.get("quote_volume_tmn_24h", "N/A"),
+                data_row.get("price_difference", "N/A"),     # Keep as string for now if formatted
+                data_row.get("percentage_difference", "N/A"), # Keep as string for now if formatted
+                data_row.get("global_price", "N/A"),
+                data_row.get("global_volume_24h", "N/A"),
+                data_row.get("global_market_cap", "N/A"),
+                data_row.get("global_percent_change_24h", "N/A"),
+            ]
+            sheet.append(row_values)
+
+            # Get the actual percentage difference (numerical) for highlighting
+            percentage_diff_val = safe_float_conversion(data_row.get("percentage_difference"))
+
+            # Highlight the Percentage Difference cell
+            percent_diff_col_idx = header.index("Percentage Difference (%)") + 1
+            cell_to_highlight = sheet.cell(row=row_idx, column=percent_diff_col_idx)
+            
+            if percentage_diff_val is not None:
+                if percentage_diff_val >= HIGHLIGHT_POSITIVE_ARB_THRESHOLD:
+                    cell_to_highlight.fill = green_fill
+                elif percentage_diff_val <= HIGHLIGHT_NEGATIVE_ARB_THRESHOLD:
+                    cell_to_highlight.fill = red_fill
+                else:
+                    cell_to_highlight.fill = yellow_fill # For small positive/negative differences
+
+        # Auto-fit columns and apply basic styling
+        for col_idx, column_title in enumerate(header, 1):
+            sheet.cell(row=1, column=col_idx).font = Font(bold=True) # Bold header
+            sheet.cell(row=1, column=col_idx).alignment = Alignment(horizontal='center', wrapText=True) # Center header, wrap text
+            
+            # Adjust column width (simple approach, might need refinement)
+            max_length = 0
+            for cell in sheet[get_column_letter(col_idx)]:
+                try:
+                    if len(str(cell.value)) > max_length:
+                        max_length = len(str(cell.value))
+                except TypeError: # Handle non-string values
+                    pass
+            adjusted_width = (max_length + 2) * 1.2 # Add some padding
+            sheet.column_dimensions[get_column_letter(col_idx)].width = adjusted_width
+
+        workbook.save(filename)
+        print(f"Full arbitrage data saved to {filename}.")
+    except Exception as e:
+        print(f"Error saving Excel file: {e}")
+
+if __name__ == "__main__":
+    while True:
+        arbitrage_results = analyze_arbitrage_prices()
+        if arbitrage_results:
+            save_arbitrage_data_to_excel(arbitrage_results)
+        time.sleep(300) # Update every 5 minutes (300 seconds)import requests
+import json
+import time
+import openpyxl
+from datetime import datetime
+from openpyxl.styles import PatternFill, Font, Alignment
+from openpyxl.utils import get_column_letter
+
+# Base URL for the Wallex API
+base_url = "https://api.wallex.ir/v1/"
+
+# --- Configuration for identifying best arbitrage opportunities ---
+# These values are examples and should be adjusted based on real market conditions and your risk tolerance.
+# A positive difference means calculated price (USDT*TMN) > direct TMN price.
+# This implies buying in TMN and selling in USDT (after converting USDT to TMN).
+MIN_PERCENT_DIFFERENCE_FOR_OPPORTUNITY = 0.1 # 0.1% minimum positive difference to be considered for console print
+MIN_QUOTE_VOLUME_USDT_FOR_LIQUIDITY = 1000  # Minimum 24h quote volume in USDT (e.g., 1000 USDT)
+MIN_QUOTE_VOLUME_TMN_FOR_LIQUIDITY = 50000000 # Minimum 24h quote volume in TMN (e.g., 50 million Toman)
+
+# --- Excel Formatting Thresholds (for highlighting) ---
+HIGHLIGHT_POSITIVE_ARB_THRESHOLD = 0.5 # Highlight green if percentage_difference >= 0.5%
+HIGHLIGHT_NEGATIVE_ARB_THRESHOLD = -0.5 # Highlight red if percentage_difference <= -0.5%
+# --- End Configuration ---
+
+
+def get_wallex_markets():
+    """Retrieves the list of markets from Wallex."""
+    try:
+        response = requests.get(base_url + "markets")
+        response.raise_for_status() # Raises an HTTPError for bad responses (4xx or 5xx)
+        data = response.json().get("result", {}).get("symbols", {})
+        return data
+    except requests.exceptions.RequestException as e:
+        print(f"Error fetching market list from Wallex API: {e}")
+        return {}
+
+def get_global_currency_stats():
+    """Retrieves global cryptocurrency statistics."""
+    try:
+        response = requests.get(base_url + "currencies/stats")
+        response.raise_for_status() # Raises an HTTPError for bad responses (4xx or 5xx)
+        data = response.json().get("result", [])
+        # Convert list of dicts to a dict keyed by 'key' (symbol like BTC, ETH) for easier lookup
+        return {item['key']: item for item in data}
+    except requests.exceptions.RequestException as e:
+        print(f"Error fetching global currency stats from Wallex API: {e}")
+        return {}
+
+def safe_float_conversion(value):
+    """Safely converts a string to float, handling None, empty string, and '-'."""
+    if value is None or value == '' or value == '-':
+        return None
+    try:
+        return float(value)
+    except ValueError:
+        return None
+
+def analyze_arbitrage_prices():
+    """Analyzes arbitrage opportunities based on price and returns the data."""
+    wallex_markets = get_wallex_markets()
+    global_stats = get_global_currency_stats() # Fetch global stats once
+    
+    # Get USDT/TMN price directly from markets endpoint
+    tether_price_tmn = None
+    if "USDTTMN" in wallex_markets and wallex_markets["USDTTMN"].get('stats'):
+        tether_price_tmn_str = wallex_markets["USDTTMN"]["stats"].get('lastPrice')
+        tether_price_tmn = safe_float_conversion(tether_price_tmn_str)
+
+    arbitrage_data = [] # Data for Excel output (all calculated data)
+    potential_opportunities = [] # Opportunities meeting basic criteria (positive diff, has volume)
+
+    if tether_price_tmn is not None and wallex_markets: # Ensure we have tether price and markets data
+        print(f"Tether price in Toman market: {tether_price_tmn:.2f}")
+        print("-------------------- Arbitrage Analysis Based on Price --------------------")
+        for symbol, details in wallex_markets.items():
+            # Only consider base assets that have a USDT pair (and are not USDTTMN itself)
+            if symbol.endswith("USDT") and symbol != "USDTTMN": 
+                base_asset = symbol[:-4]
+                
+                # Get market-specific stats for USDT pair
+                usdt_stats = details.get('stats', {})
+                usdt_last_price = safe_float_conversion(usdt_stats.get('lastPrice'))
+                usdt_bid_price = safe_float_conversion(usdt_stats.get('bidPrice'))
+                usdt_ask_price = safe_float_conversion(usdt_stats.get('askPrice'))
+                usdt_volume_24h = safe_float_conversion(usdt_stats.get('24h_volume'))
+                usdt_quote_volume_24h = safe_float_conversion(usdt_stats.get('24h_quoteVolume'))
+                
+                tmn_symbol = f"{base_asset}TMN"
+
+                # Check if the corresponding TMN pair exists and has stats
+                if usdt_last_price is not None and tmn_symbol in wallex_markets and wallex_markets[tmn_symbol].get('stats'):
+                    tmn_stats = wallex_markets[tmn_symbol].get('stats', {})
+                    tmn_last_price_direct = safe_float_conversion(tmn_stats.get('lastPrice'))
+                    tmn_bid_price = safe_float_conversion(tmn_stats.get('bidPrice'))
+                    tmn_ask_price = safe_float_conversion(tmn_stats.get('askPrice'))
+                    tmn_volume_24h = safe_float_conversion(tmn_stats.get('24h_volume'))
+                    tmn_quote_volume_24h = safe_float_conversion(tmn_stats.get('24h_quoteVolume'))
+                    
+                    if tmn_last_price_direct is not None:
+                        calculated_price_tmn_from_usdt = usdt_last_price * tether_price_tmn
+                        price_difference = calculated_price_tmn_from_usdt - tmn_last_price_direct
+                        
+                        # Avoid division by zero for percentage_difference
+                        percentage_difference = (price_difference / tmn_last_price_direct) * 100 if tmn_last_price_direct != 0 else 0 
+
+                        # Get global stats for the base asset if available
+                        global_asset_stats = global_stats.get(base_asset, {})
+                        global_price = safe_float_conversion(global_asset_stats.get('price'))
+                        global_volume_24h = safe_float_conversion(global_asset_stats.get('volume_24h'))
+                        global_market_cap = safe_float_conversion(global_asset_stats.get('market_cap'))
+                        global_percent_change_24h = safe_float_conversion(global_asset_stats.get('percent_change_24h'))
+
+                        # Store all data for Excel output (original numerical values for proper Excel formatting)
+                        current_analysis = {
+                            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                            "symbol": base_asset,
+                            "price_usdt_last": usdt_last_price,
+                            "price_usdt_bid": usdt_bid_price,
+                            "price_usdt_ask": usdt_ask_price,
+                            "volume_usdt_24h": usdt_volume_24h,
+                            "quote_volume_usdt_24h": usdt_quote_volume_24h,
+                            "price_tmn_calculated": calculated_price_tmn_from_usdt,
+                            "price_tmn_direct": tmn_last_price_direct,
+                            "price_tmn_bid": tmn_bid_price,
+                            "price_tmn_ask": tmn_ask_price,
+                            "volume_tmn_24h": tmn_volume_24h,
+                            "quote_volume_tmn_24h": tmn_quote_volume_24h,
+                            "price_difference": price_difference,
+                            "percentage_difference": percentage_difference,
+                            "global_price": global_price,
+                            "global_volume_24h": global_volume_24h,
+                            "global_market_cap": global_market_cap,
+                            "global_percent_change_24h": global_percent_change_24h,
+                        }
+                        arbitrage_data.append(current_analysis)
+                        
+                        # Store potential opportunities (for console print)
+                        # Filter for positive arbitrage opportunity
+                        if percentage_difference > MIN_PERCENT_DIFFERENCE_FOR_OPPORTUNITY and \
+                           usdt_quote_volume_24h is not None and usdt_quote_volume_24h >= MIN_QUOTE_VOLUME_USDT_FOR_LIQUIDITY and \
+                           tmn_quote_volume_24h is not None and tmn_quote_volume_24h >= MIN_QUOTE_VOLUME_TMN_FOR_LIQUIDITY:
+                            potential_opportunities.append({
+                                "symbol": base_asset,
+                                "percentage_difference": percentage_difference,
+                                "usdt_quote_volume_24h": usdt_quote_volume_24h,
+                                "tmn_quote_volume_24h": tmn_quote_volume_24h,
+                                "price_usdt_last": usdt_last_price,
+                                "price_tmn_calculated": calculated_price_tmn_from_usdt,
+                                "price_tmn_direct": tmn_last_price_direct,
+                                "price_difference": price_difference
+                            })
+                        
+                        # Print to console (formatted strings)
+                        print(f"Asset: {base_asset}")
+                        print(f"  USDT (Last/Bid/Ask): {current_analysis['price_usdt_last']}/{current_analysis['price_usdt_bid']}/{current_analysis['price_usdt_ask']} (Vol: {current_analysis['volume_usdt_24h']} {base_asset})")
+                        print(f"  TMN Calc: {current_analysis['price_tmn_calculated']}, TMN Direct (Last/Bid/Ask): {current_analysis['price_tmn_direct']}/{current_analysis['price_tmn_bid']}/{current_analysis['price_tmn_ask']} (Vol: {current_analysis['volume_tmn_24h']} {base_asset})")
+                        print(f"  Price Diff: {current_analysis['price_difference']}, Percentage Diff: {current_analysis['percentage_difference']}%")
+                        print(f"  Global Price: {current_analysis['global_price']}, Global 24h Vol: {current_analysis['global_volume_24h']}, Global Market Cap: {current_analysis['global_market_cap']}, Global 24h Chg: {current_analysis['global_percent_change_24h']}%")
+                        print("-------------------------------------------------------")
+    else:
+        print("Error fetching Tether price in Toman market. Cannot perform arbitrage analysis.")
+        return [] # Return empty list if critical data is missing
+
+    # --- Identify and print best opportunities ---
+    print("\n======== Best Arbitrage Opportunities (Based on Filters) ========")
+    # Opportunities are already filtered for MIN_PERCENT_DIFFERENCE_FOR_OPPORTUNITY and liquidity earlier
+    # So we just need to sort them now.
+    filtered_opportunities = potential_opportunities # Use the already filtered list
+
+    # Sort by percentage difference in descending order
+    filtered_opportunities.sort(key=lambda x: x['percentage_difference'], reverse=True)
+
+    if filtered_opportunities:
+        print(f"Found {len(filtered_opportunities)} potential opportunities meeting minimum criteria:")
+        for i, op in enumerate(filtered_opportunities[:5]): # Print top 5 opportunities
+            print(f"  {i+1}. Symbol: {op['symbol']}")
+            print(f"     Percentage Diff: {op['percentage_difference']:.4f}%")
+            print(f"     USDT Quote Volume (24h): {op['usdt_quote_volume_24h']:.2f}")
+            print(f"     TMN Quote Volume (24h): {op['tmn_quote_volume_24h']:.2f}")
+            print(f"     Calc TMN Price: {op['price_tmn_calculated']:.2f}, Direct TMN Price: {op['price_tmn_direct']:.2f}")
+            print("     --------------------")
+    else:
+        print("No arbitrage opportunities found meeting the specified criteria (%.4f%% diff and liquidity)." % MIN_PERCENT_DIFFERENCE_FOR_OPPORTUNITY)
+    print("================================================================")
+
+    return arbitrage_data # This list goes to Excel
+
+def save_arbitrage_data_to_excel(arbitrage_data, filename="arbitrage_analysis_full_data.xlsx"):
+    """Saves the arbitrage data with full market and global stats to an Excel file with clean formatting."""
+    try:
+        workbook = openpyxl.Workbook()
+        sheet = workbook.active
+
+        # Define headers
+        header = [
+            "Timestamp", "Symbol", 
+            "Price (USDT) Last", "Price (USDT) Bid", "Price (USDT) Ask", "Volume (USDT) 24h", "Quote Volume (USDT) 24h",
+            "Calculated Price (TMN)", "Direct Price (TMN) Last", "Price (TMN) Bid", "Price (TMN) Ask", 
+            "Volume (TMN) 24h", "Quote Volume (TMN) 24h",
+            "Price Difference", "Percentage Difference (%)",
+            "Global Price", "Global Volume 24h", "Global Market Cap", "Global % Change 24h"
+        ]
+        sheet.append(header)
+
+        # Define colors for highlighting
+        green_fill = PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid") # Light Green
+        red_fill = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type="solid")     # Light Red
+        yellow_fill = PatternFill(start_color="FFEB9C", end_color="FFEB9C", fill_type="solid")   # Light Yellow
+
+        # Apply data and formatting
+        for row_idx, data_row in enumerate(arbitrage_data, start=2): # Start from row 2 as row 1 is header
+            # Append data, ensuring conversion to actual numbers where possible
+            row_values = [
+                data_row.get("timestamp", "N/A"),
+                data_row.get("symbol", "N/A"),
+                data_row.get("price_usdt_last", "N/A"),
+                data_row.get("price_usdt_bid", "N/A"),
+                data_row.get("price_usdt_ask", "N/A"),
+                data_row.get("volume_usdt_24h", "N/A"),
+                data_row.get("quote_volume_usdt_24h", "N/A"),
+                data_row.get("price_tmn_calculated", "N/A"), # Keep as string for now if formatted
+                data_row.get("price_tmn_direct", "N/A"),     # Keep as string for now if formatted
+                data_row.get("price_tmn_bid", "N/A"),
+                data_row.get("price_tmn_ask", "N/A"),
+                data_row.get("volume_tmn_24h", "N/A"),
+                data_row.get("quote_volume_tmn_24h", "N/A"),
+                data_row.get("price_difference", "N/A"),     # Keep as string for now if formatted
+                data_row.get("percentage_difference", "N/A"), # Keep as string for now if formatted
+                data_row.get("global_price", "N/A"),
+                data_row.get("global_volume_24h", "N/A"),
+                data_row.get("global_market_cap", "N/A"),
+                data_row.get("global_percent_change_24h", "N/A"),
+            ]
+            sheet.append(row_values)
+
+            # Get the actual percentage difference (numerical) for highlighting
+            percentage_diff_val = safe_float_conversion(data_row.get("percentage_difference"))
+
+            # Highlight the Percentage Difference cell
+            percent_diff_col_idx = header.index("Percentage Difference (%)") + 1
+            cell_to_highlight = sheet.cell(row=row_idx, column=percent_diff_col_idx)
+            
+            if percentage_diff_val is not None:
+                if percentage_diff_val >= HIGHLIGHT_POSITIVE_ARB_THRESHOLD:
+                    cell_to_highlight.fill = green_fill
+                elif percentage_diff_val <= HIGHLIGHT_NEGATIVE_ARB_THRESHOLD:
+                    cell_to_highlight.fill = red_fill
+                else:
+                    cell_to_highlight.fill = yellow_fill # For small positive/negative differences
+
+        # Auto-fit columns and apply basic styling
+        for col_idx, column_title in enumerate(header, 1):
+            sheet.cell(row=1, column=col_idx).font = Font(bold=True) # Bold header
+            sheet.cell(row=1, column=col_idx).alignment = Alignment(horizontal='center', wrapText=True) # Center header, wrap text
+            
+            # Adjust column width (simple approach, might need refinement)
+            max_length = 0
+            for cell in sheet[get_column_letter(col_idx)]:
+                try:
+                    if len(str(cell.value)) > max_length:
+                        max_length = len(str(cell.value))
+                except TypeError: # Handle non-string values
+                    pass
+            adjusted_width = (max_length + 2) * 1.2 # Add some padding
+            sheet.column_dimensions[get_column_letter(col_idx)].width = adjusted_width
+
+        workbook.save(filename)
+        print(f"Full arbitrage data saved to {filename}.")
+    except Exception as e:
+        print(f"Error saving Excel file: {e}")
+
+if __name__ == "__main__":
+    while True:
+        arbitrage_results = analyze_arbitrage_prices()
+        if arbitrage_results:
+            save_arbitrage_data_to_excel(arbitrage_results)
+        time.sleep(30) # Update every 5 minutes (300 seconds)
